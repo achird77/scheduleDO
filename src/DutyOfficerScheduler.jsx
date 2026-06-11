@@ -93,12 +93,40 @@ function buildBlocked(cfg, dwWeek, off) {
   return blocked;
 }
 
+// per-type block-length limits (fall back to the shared values for old sessions)
+const minC = (cfg, S) => S === NIGHT ? (cfg.minConsecutiveNight ?? cfg.minConsecutive) : (cfg.minConsecutiveDay ?? cfg.minConsecutive);
+const maxC = (cfg, S) => S === NIGHT ? (cfg.maxConsecutiveNight ?? cfg.maxConsecutive) : (cfg.maxConsecutiveDay ?? cfg.maxConsecutive);
+
+// most recent watch-block type before day t, and how many same-type blocks end the run
+function typeRunInfo(a, o, t) {
+  let d = t - 1;
+  while (d >= 0 && (a[o][d] === OFF || a[o][d] === DW)) d--;
+  if (d < 0) return { lastType: OFF, runBlocks: 0 };
+  const lastType = a[o][d];
+  let runBlocks = 0;
+  while (d >= 0) {
+    while (d >= 0 && (a[o][d] === OFF || a[o][d] === DW)) d--;
+    if (d < 0 || a[o][d] !== lastType) break;
+    runBlocks++;
+    while (d >= 0 && a[o][d] === lastType) d--;
+  }
+  return { lastType, runBlocks };
+}
+// may officer o start a new block of type S on day t, given the same-type-run rule?
+function typeAllowed(cfg, a, o, t, S) {
+  const minB = cfg.minBlocksPerType ?? 1, maxB = cfg.maxBlocksPerType ?? 99;
+  const { lastType, runBlocks } = typeRunInfo(a, o, t);
+  if (lastType === OFF) return true;
+  if (S === lastType) return runBlocks < maxB;   // keep same type only if under the cap
+  return runBlocks >= minB;                       // switch only after enough same-type blocks
+}
+
 function canStartNew(cfg, a, o, t, S) {
   const T = cfg.weeks * 7;
   if (weekdayOf(cfg.startDow, t) === 6) return false;
   if (a.__blocked[o][t]) return false;
-  if (t === T - 1 && cfg.minConsecutive > 1) return false;
-  if (cfg.minConsecutive > 1 && t + 1 < T && a.__blocked[o][t + 1]) return false;
+  if (t === T - 1 && minC(cfg, S) > 1) return false;
+  if (minC(cfg, S) > 1 && t + 1 < T && a.__blocked[o][t + 1]) return false;
   const { day: e, type: lt } = lastWorkInfo(a, o, t);
   if (e < 0) return true;
   const gap = t - e - 1;
@@ -110,23 +138,23 @@ function canStartNew(cfg, a, o, t, S) {
 function slotChoices(cfg, a, t, S, rng) {
   const N = cfg.officers.length, wd = weekdayOf(cfg.startDow, t);
   if (wd === 6) {
-    for (let o = 0; o < N; o++) if (a[o][t - 1] === S)
-      return { forced: runLenBack(a, o, t - 1, S) < cfg.maxConsecutive ? o : -1 };
+    for (let o = 0; o < N; o++) if (a[o][t - 1] === S && !a.__blocked[o][t])
+      return { forced: runLenBack(a, o, t - 1, S) < maxC(cfg, S) ? o : -1 };
     return { forced: -1 };
   }
-  for (let o = 0; o < N; o++) if (t > 0 && a[o][t - 1] === S) {
+  for (let o = 0; o < N; o++) if (t > 0 && a[o][t - 1] === S && !a.__blocked[o][t]) {
     const rl = runLenBack(a, o, t - 1, S);
-    if (rl < cfg.minConsecutive) return { forced: rl < cfg.maxConsecutive ? o : -1 };
+    if (rl < minC(cfg, S)) return { forced: rl < maxC(cfg, S) ? o : -1 };
   }
   const opts = [];
   for (let o = 0; o < N; o++) {
     if (a.__blocked[o][t]) continue;
     if (t > 0 && a[o][t - 1] === S) {
       const rl = runLenBack(a, o, t - 1, S);
-      if (rl >= cfg.minConsecutive && rl < cfg.maxConsecutive) opts.push(o);
-    } else if (canStartNew(cfg, a, o, t, S)) opts.push(o);
+      if (rl >= minC(cfg, S) && rl < maxC(cfg, S)) opts.push(o);
+    } else if (canStartNew(cfg, a, o, t, S) && typeAllowed(cfg, a, o, t, S)) opts.push(o);
   }
-  const isWknd = wd >= 5, cost = {}, carry = cfg.carry;
+  const isWknd = wd >= 5, cost = {}, carry = cfg.carry, prefer = cfg.preferGrid, pFrom = cfg.preferFrom || 0;
   for (const o of opts) {
     let days = 0, dayC = 0, nightC = 0, wknC = 0;
     for (let dd = 0; dd < t; dd++) {
@@ -137,6 +165,8 @@ function slotChoices(cfg, a, t, S, rng) {
     if (carry) { dayC += carry.day[o] || 0; nightC += carry.night[o] || 0; wknC += carry.weekend[o] || 0; days += (carry.day[o] || 0) + (carry.night[o] || 0); }
     const bal = S === DAY ? dayC - nightC : nightC - dayC;
     cost[o] = days * 1.0 + (isWknd ? wknC * 3.0 : 0) + bal * 1.5 + rng() * 1.5;
+    if (wd === 5 && (a[o][t - 7] === DAY || a[o][t - 7] === NIGHT || (t - 6 >= 0 && (a[o][t - 6] === DAY || a[o][t - 6] === NIGHT)))) cost[o] += 8; // avoid back-to-back weekends
+    if (prefer && t >= pFrom && prefer[o][t] === S) cost[o] -= 2; // gentle nudge toward the existing roster
   }
   opts.sort((x, y) => cost[x] - cost[y]);
   return { options: opts };
@@ -179,6 +209,11 @@ function tileWatches(cfg, dwWeek, rng, budget, off, history) {
 function hoursOf(cfg, a, o) { let h = 0; for (const c of a[o]) h += c === DAY ? cfg.dayHours : c === NIGHT ? cfg.nightHours : c === DW ? cfg.dayworkHours : 0; return h; }
 const countOf = (a, o, S) => a[o].reduce((x, c) => x + (c === S ? 1 : 0), 0);
 function weekendOf(cfg, a, o) { const T = cfg.weeks * 7; let n = 0; for (let t = 0; t < T; t++) if (weekdayOf(cfg.startDow, t) >= 5 && (a[o][t] === DAY || a[o][t] === NIGHT)) n++; return n; }
+function weekendsWorked(cfg, a, o) {
+  const T = cfg.weeks * 7, res = [];
+  for (let w = 0; w < cfg.weeks; w++) { const sat = w * 7 + 5; let on = false; for (const t of [sat, sat + 1]) if (t < T && (a[o][t] === DAY || a[o][t] === NIGHT)) on = true; res.push(on); }
+  return res;
+}
 function softScore(cfg, a) {
   const N = cfg.officers.length, sp = arr => Math.max(...arr) - Math.min(...arr), carry = cfg.carry;
   const hrs = [...Array(N)].map((_, o) => hoursOf(cfg, a, o) + (carry ? carry.hours[o] || 0 : 0));
@@ -189,6 +224,10 @@ function softScore(cfg, a) {
   for (let o = 0; o < N; o++) s += cfg.wDaynightSelf * Math.abs(days[o] - nights[o]);
   s += cfg.wDaynightSpread * (sp(days) + sp(nights));
   s += cfg.wWeekend * sp(wknd);
+  // penalise back-to-back weekends for the same officer ("no consecutive weekends if possible")
+  let consec = 0;
+  for (let o = 0; o < N; o++) { const ww = weekendsWorked(cfg, a, o); for (let w = 0; w < ww.length - 1; w++) if (ww[w] && ww[w + 1]) consec++; }
+  s += (cfg.wWeekend + cfg.wDaynightSpread) * consec;
   return s;
 }
 
@@ -208,7 +247,7 @@ function generateSchedule(cfg0, seed, opts = {}) {
     if (sc === 0) break;
   }
   if (!best)
-    return { ok: false, status: "INFEASIBLE", message: "No valid roster exists for these settings. Try adding an officer, reducing day-work per week, easing the time-off requests, or relaxing the consecutive/rest rules.", attempts };
+    return { ok: false, status: "INFEASIBLE", message: "No valid roster exists for these settings. Try adding an officer, reducing day-work per week, easing the time-off requests, allowing fewer blocks before a day↔night switch, or relaxing the consecutive/rest rules.", attempts };
   // strip the fixed history week before returning
   const grid = best.map(row => row.slice(off).map(c => CODE_NAME[c]));
   return { ok: true, status: bestScore === 0 ? "OPTIMAL" : "FEASIBLE", grid, score: bestScore, attempts };
@@ -236,10 +275,38 @@ function validate(cfg, grid) {
         if (((x === DAY || x === NIGHT) && y === DW) || (x === DW && (y === DAY || y === NIGHT))) problems.push(`${cfg.officers[o]}: 12h↔8h gap < ${gwh} (around day ${t + 1})`);
       }
     }
-    let run = 0;
+    let run = 0, runType = 0;
     for (let t = 0; t <= T; t++) {
-      const isw = t < T && (row[t] === DAY || row[t] === NIGHT);
-      if (isw) run++; else { if (run > 0) { if (run < cfg.minConsecutive) problems.push(`${cfg.officers[o]}: block of ${run} < min ${cfg.minConsecutive} (ending day ${t})`); if (run > cfg.maxConsecutive) problems.push(`${cfg.officers[o]}: block of ${run} > max ${cfg.maxConsecutive} (ending day ${t})`); } run = 0; }
+      const c = t < T ? row[t] : OFF;
+      const isw = c === DAY || c === NIGHT;
+      if (isw && (run === 0 || c === runType)) { run++; runType = c; }
+      else {
+        if (run > 0) {
+          const lab = runType === NIGHT ? "night" : "day";
+          if (run < minC(cfg, runType)) problems.push(`${cfg.officers[o]}: ${lab} block of ${run} < min ${minC(cfg, runType)} (ending day ${t})`);
+          if (run > maxC(cfg, runType)) problems.push(`${cfg.officers[o]}: ${lab} block of ${run} > max ${maxC(cfg, runType)} (ending day ${t})`);
+        }
+        if (isw) { run = 1; runType = c; } else { run = 0; runType = 0; }
+      }
+    }
+    // consecutive same-type blocks before switching day↔night
+    if ((cfg.minBlocksPerType ?? 1) > 1 || (cfg.maxBlocksPerType ?? 99) < 99) {
+      const minB = cfg.minBlocksPerType ?? 1, maxB = cfg.maxBlocksPerType ?? 99;
+      const blocks = []; let cur = 0, rd = 0;
+      for (let t = 0; t <= T; t++) {
+        const c = t < T ? g[o][t] : 0, isw = c === DAY || c === NIGHT;
+        if (isw && (rd === 0 || c === cur)) { rd++; cur = c; }
+        else { if (rd > 0) blocks.push(cur); if (isw) { rd = 1; cur = c; } else { rd = 0; cur = 0; } }
+      }
+      const firstExempt = !!cfg.history;
+      let i = 0;
+      while (i < blocks.length) {
+        let j = i; while (j < blocks.length && blocks[j] === blocks[i]) j++;
+        const len = j - i, isLast = j === blocks.length, lab = blocks[i] === NIGHT ? "night" : "day";
+        if (len > maxB) problems.push(`${cfg.officers[o]}: ${len} ${lab} blocks in a row > max ${maxB} before switching`);
+        if (len < minB && !isLast && !(i === 0 && firstExempt)) problems.push(`${cfg.officers[o]}: only ${len} ${lab} block(s) before switching < min ${minB}`);
+        i = j;
+      }
     }
   }
   for (let t = 0; t < T - 1; t++) if (weekdayOf(cfg.startDow, t) === 5)
@@ -251,57 +318,165 @@ function validate(cfg, grid) {
 }
 
 // Patch a generated roster after officers become unavailable (sick / PTO).
-// unavail: array of {o, t}.  Returns { grid, changes:[], unresolved:[] }.
+// Re-cover a roster after watch officers go sick / off.
+//   1. if a day-work DO is on duty that weekday, move them onto the open watch (cheapest fix)
+//   2. otherwise re-generate from the affected day on, keeping the rest as close to the
+//      original as possible (minimal impact)
+// Day-work absences need no re-cover. unavail: [{o,t}]. Returns {grid, changes, notes, unresolved, method, changed}.
+function regenSuffix(cfg, gridCodes, fromDay, blockedAt, seed) {
+  const N = cfg.officers.length, T = cfg.weeks * 7, budget = 200000;
+  const dwWeek = Array.from({ length: N }, () => new Array(cfg.weeks).fill(false));
+  for (let o = 0; o < N; o++) for (let w = 0; w < cfg.weeks; w++)
+    for (let t = w * 7; t < Math.min(w * 7 + 7, T); t++) if (gridCodes[o][t] === DW) { dwWeek[o][w] = true; break; }
+  const unav = Array.from({ length: N }, () => []);
+  for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) if (blockedAt[o][t]) unav[o].push(t);
+  const cfg2 = Object.assign({}, cfg, { unavailable: unav, preferGrid: gridCodes, preferFrom: fromDay, history: null, carry: null });
+  const rng = mulberry32(seed >>> 0);
+  const a = Array.from({ length: N }, () => new Array(T).fill(OFF));
+  a.__dw = dwWeek;
+  a.__blocked = buildBlocked(cfg2, dwWeek, 0);
+  for (let o = 0; o < N; o++) for (let t = 0; t < fromDay; t++) a[o][t] = gridCodes[o][t];               // fixed prefix
+  for (let o = 0; o < N; o++) for (let w = 0; w < cfg.weeks; w++) if (dwWeek[o][w])
+    for (let t = Math.max(fromDay, w * 7); t < Math.min(w * 7 + 7, T); t++) if (weekdayOf(cfg.startDow, t) < 5) a[o][t] = DW; // fixed day-work
+  const ctr = { n: 0 };
+  function rec(t) {
+    if (++ctr.n > budget) return false;
+    if (t >= T) return true;
+    const dc = slotChoices(cfg2, a, t, DAY, rng), nc = slotChoices(cfg2, a, t, NIGHT, rng);
+    const dl = dc.forced !== undefined ? [dc.forced] : dc.options;
+    const nl = nc.forced !== undefined ? [nc.forced] : nc.options;
+    if (dl.includes(-1) || nl.includes(-1) || !dl.length || !nl.length) return false;
+    for (const dO of dl) {
+      if (dO < 0) continue; a[dO][t] = DAY;
+      for (const nO of nl) {
+        if (nO < 0 || nO === dO || a[nO][t] !== OFF) continue;
+        a[nO][t] = NIGHT;
+        if (rec(t + 1)) return true;
+        a[nO][t] = OFF;
+      }
+      a[dO][t] = OFF;
+    }
+    return false;
+  }
+  return rec(fromDay) ? a : null;
+}
+
+function introducesProblem(cfg, g, o, T) {
+  const row = g[o], gdn = Math.max(1, cfg.switchDaynightOffDays), gwh = Math.max(1, cfg.switchWorkhoursOffDays);
+  for (let t = 0; t < T; t++) {
+    for (let k = 1; k <= gdn; k++) if (t + k < T) {
+      if (row[t] === DAY && row[t + k] === NIGHT) return true;
+      if (row[t] === NIGHT && row[t + k] === DAY) return true;
+    }
+    for (let k = 1; k <= gwh; k++) if (t + k < T) {
+      const x = row[t], y = row[t + k];
+      if (((x === DAY || x === NIGHT) && y === DW) || (x === DW && (y === DAY || y === NIGHT))) return true;
+    }
+  }
+  let run = 0, runType = 0;
+  for (let t = 0; t <= T; t++) {
+    const c = t < T ? row[t] : OFF, isw = c === DAY || c === NIGHT;
+    if (isw && (run === 0 || c === runType)) { run++; runType = c; }
+    else { if (run > 0 && (run < minC(cfg, runType) || run > maxC(cfg, runType))) return true; if (isw) { run = 1; runType = c; } else { run = 0; runType = 0; } }
+  }
+  return false;
+}
+
 function repair(cfg, gridStr, unavail) {
   const N = cfg.officers.length, T = cfg.weeks * 7;
   const g = gridStr.map(r => r.map(x => NAME_CODE[x] ?? 0));
+  const orig = gridStr.map(r => r.map(x => NAME_CODE[x] ?? 0));
+  const changes = [], notes = [], unresolved = [];
   const blockedAt = Array.from({ length: N }, () => new Array(T).fill(false));
-  for (const { o, t } of unavail) if (o >= 0 && o < N && t >= 0 && t < T) blockedAt[o][t] = true;
-  const changes = [], unresolved = [], affected = new Set();
+  const wkPair = (t) => weekdayOf(cfg.startDow, t) === 5 ? [t, t + 1] : weekdayOf(cfg.startDow, t) === 6 ? [t - 1, t] : [t];
+  const labelOf = (S) => S === NIGHT ? "night watch" : "day watch";
+  let method = "none";
+
+  // 1. apply the absences; collect open watch slots (weekend slots expand to the pair)
+  const freed = [];
   for (const { o, t } of unavail) {
     if (o < 0 || o >= N || t < 0 || t >= T) continue;
-    if (g[o][t] !== OFF) { changes.push({ o, t, from: CODE_NAME[g[o][t]], to: "OFF" }); g[o][t] = OFF; }
-    affected.add(t);
+    const c = g[o][t];
+    if (c === DAY || c === NIGHT) {
+      for (const x of wkPair(t).filter(x => x >= 0 && x < T)) {
+        if (g[o][x] === c) { changes.push({ o, t: x, from: CODE_NAME[c], to: "OFF" }); g[o][x] = OFF; }
+        blockedAt[o][x] = true;
+        if (!freed.some(f => f.t === x && f.S === c)) freed.push({ t: x, S: c });
+      }
+    } else if (c === DW) { changes.push({ o, t, from: "DAYWORK", to: "OFF" }); g[o][t] = OFF; } // day-work: no re-cover needed
   }
-  const slotCount = (t, S) => { let c = 0; for (let o = 0; o < N; o++) if (g[o][t] === S) c++; return c; };
-  const introducesProblem = (o) => {
-    // check officer o's local rules across the whole row (cheap for small grids)
-    const row = g[o], gdn = Math.max(1, cfg.switchDaynightOffDays), gwh = Math.max(1, cfg.switchWorkhoursOffDays);
-    for (let t = 0; t < T; t++) {
-      for (let k = 1; k <= gdn; k++) if (t + k < T) {
-        if (row[t] === DAY && row[t + k] === NIGHT) return true;
-        if (row[t] === NIGHT && row[t + k] === DAY) return true;
-      }
-      for (let k = 1; k <= gwh; k++) if (t + k < T) {
-        const x = row[t], y = row[t + k];
-        if (((x === DAY || x === NIGHT) && y === DW) || (x === DW && (y === DAY || y === NIGHT))) return true;
-      }
-    }
-    let run = 0;
-    for (let t = 0; t <= T; t++) { const isw = t < T && (row[t] === DAY || row[t] === NIGHT); if (isw) run++; else { if (run > cfg.maxConsecutive) return true; run = 0; } }
-    return false;
-  };
-  const weekendPair = (t) => weekdayOf(cfg.startDow, t) === 5 ? [t, t + 1] : weekdayOf(cfg.startDow, t) === 6 ? [t - 1, t] : [t];
-  for (const t of [...affected].sort((a, b) => a - b)) {
-    for (const S of [DAY, NIGHT]) {
-      if (slotCount(t, S) >= 1) continue;
-      const pair = weekendPair(t).filter(x => x >= 0 && x < T);
-      let filled = false;
-      // prefer candidates who already work this type adjacent to t (extends a block)
-      const score = (p) => (((t > 0 && g[p][t - 1] === S) || (t + 1 < T && g[p][t + 1] === S)) ? 0 : 1) + Math.random() * 0.5;
-      const cand = [...Array(N).keys()].sort((p, q) => score(p) - score(q));
-      for (const p of cand) {
-        if (pair.some(x => g[p][x] !== OFF || blockedAt[p][x])) continue;
-        // don't clash with the other slot on those days
-        if (pair.some(x => { for (let q = 0; q < N; q++) if (q !== p && g[q][x] === S) { } return false; })) { }
-        pair.forEach(x => { g[p][x] = S; });
-        if (!introducesProblem(p)) { pair.forEach(x => changes.push({ o: p, t: x, from: "OFF", to: CODE_NAME[S], fill: true })); filled = true; break; }
-        pair.forEach(x => { g[p][x] = OFF; });
-      }
-      if (!filled) unresolved.push({ t, slot: CODE_NAME[S] });
+  if (!freed.length) return { grid: g.map(r => r.map(c => CODE_NAME[c])), changes, notes, unresolved, method, changed: changes.length };
+
+  // 2. If every open slot is a weekday with a distinct day-work DO free, cover with day-work DOs.
+  const allWeekday = freed.every(f => weekdayOf(cfg.startDow, f.t) < 5);
+  let dwPlan = null;
+  if (allWeekday) {
+    dwPlan = []; const used = {};
+    for (const { t, S } of freed) {
+      let p = -1;
+      for (let q = 0; q < N; q++) if (g[q][t] === DW && !blockedAt[q][t] && !used[`${q}_${t}`]) { p = q; break; }
+      if (p < 0) { dwPlan = null; break; }
+      used[`${p}_${t}`] = true; dwPlan.push({ p, t, S });
     }
   }
-  return { grid: g.map(r => r.map(c => CODE_NAME[c])), changes, unresolved };
+
+  if (dwPlan) {
+    for (const { p, t, S } of dwPlan) {
+      g[p][t] = S;
+      changes.push({ o: p, t, from: "DAYWORK", to: CODE_NAME[S], dwCover: true });
+      notes.push(`${cfg.officers[p]} moved from day-work to ${labelOf(S)} for day ${t + 1}.`);
+    }
+    method = "daywork";
+  } else {
+    // 3. No day-work cover — re-generate so the rules still hold and weekends stay balanced.
+    //    Re-tile from the Monday of the affected week (backing up a week at a time only if needed),
+    //    choosing the result with the most equal weekend split, fewest back-to-back weekends,
+    //    best overall balance, then the fewest changes.
+    const earliest = Math.min(...freed.map(f => f.t));
+    const weekStart = earliest - (earliest % 7);
+    const levels = []; for (let fd = weekStart; fd >= 0; fd -= 7) levels.push(fd); if (levels[levels.length - 1] !== 0) levels.push(0);
+    const wkDaysOf = (a, o) => { let n = 0; for (let w = 0; w < cfg.weeks; w++) for (const x of [w * 7 + 5, w * 7 + 6]) if (x < T && (a[o][x] === DAY || a[o][x] === NIGHT)) n++; return n; };
+    const consecOf = (a) => { let c = 0; for (let o = 0; o < N; o++) { const ww = []; for (let w = 0; w < cfg.weeks; w++) { let on = false; for (const x of [w * 7 + 5, w * 7 + 6]) if (x < T && (a[o][x] === DAY || a[o][x] === NIGHT)) on = true; ww.push(on); } for (let w = 0; w < ww.length - 1; w++) if (ww[w] && ww[w + 1]) c++; } return c; };
+    let chosen = null, usedStart = earliest; const t0 = Date.now();
+    for (const fd of levels) {
+      const cands = [];
+      for (let s = 1; s <= 30 && Date.now() - t0 < 2200; s++) {
+        const res = regenSuffix(cfg, g, fd, blockedAt, s * 4099 + fd);
+        if (!res) continue;
+        const wd = [...Array(N)].map((_, o) => wkDaysOf(res, o));
+        let ch = 0; for (let o = 0; o < N; o++) for (let t = fd; t < T; t++) if (res[o][t] !== orig[o][t]) ch++;
+        cands.push({ res, wkSp: Math.max(...wd) - Math.min(...wd), consec: consecOf(res), sc: softScore(cfg, res), ch });
+      }
+      if (cands.length) {
+        cands.sort((a, b) => a.wkSp - b.wkSp || a.consec - b.consec || a.sc - b.sc || a.ch - b.ch);
+        chosen = cands[0]; usedStart = fd; break;
+      }
+      if (Date.now() - t0 > 2200) break;
+    }
+    if (chosen) {
+      for (let o = 0; o < N; o++) for (let t = usedStart; t < T; t++) g[o][t] = chosen.res[o][t];
+      method = "regenerated";
+      notes.push(`Re-generated from day ${usedStart + 1} on — weekends and shifts re-balanced across the team (${chosen.ch} cell(s) changed). Earlier days are unchanged.`);
+    } else {
+      // 4. Last resort — patch the open slot(s) locally (may bend a rest rule).
+      method = "patched";
+      const wkPairR = (t) => weekdayOf(cfg.startDow, t) === 5 ? [t, t + 1] : weekdayOf(cfg.startDow, t) === 6 ? [t - 1, t] : [t];
+      for (const { t, S } of freed) {
+        let cnt = 0; for (let o = 0; o < N; o++) if (g[o][t] === S) cnt++; if (cnt >= 1) continue;
+        const pair = wkPairR(t).filter(x => x >= 0 && x < T);
+        const cc = [...Array(N).keys()].filter(p => pair.every(x => g[p][x] === OFF && !blockedAt[p][x]));
+        let pchosen = -1;
+        for (const p of cc) { pair.forEach(x => { g[p][x] = S; }); if (!introducesProblem(cfg, g, p, T)) { pchosen = p; break; } pair.forEach(x => { g[p][x] = OFF; }); }
+        if (pchosen < 0 && cc.length) { pchosen = cc[0]; pair.forEach(x => { g[pchosen][x] = S; }); }
+        if (pchosen >= 0) { pair.forEach(x => changes.push({ o: pchosen, t: x, from: "OFF", to: CODE_NAME[S], fill: true })); notes.push(`${cfg.officers[pchosen]} covers the ${labelOf(S)} for day ${pair.map(x => x + 1).join("–")} (emergency cover — please review, it may bend a rest rule).`); }
+        else unresolved.push({ t, slot: CODE_NAME[S] });
+      }
+    }
+  }
+
+  let changed = 0;
+  for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) if (g[o][t] !== orig[o][t]) changed++;
+  return { grid: g.map(r => r.map(c => CODE_NAME[c])), changes, notes, unresolved, method, changed };
 }
 
 function metrics(cfg, grid) {
@@ -327,12 +502,18 @@ function rulesText(cfg) {
       ? `${cfg.dayworkPerWeek} officer(s) per week on the 8h day-work shift (${cfg.dayworkLabel} ${cfg.dayworkTime}, ${cfg.dayworkHours}h), Mon–Fri, rotated week to week.`
       : `No 8h day-work shift in use.`,
     `Weekends: whoever works Saturday also works Sunday — one officer for the day watch, one for the night.`,
-    `Watch blocks run ${cfg.minConsecutive}–${cfg.maxConsecutive} consecutive days, with at least ${cfg.restDaysAfterBlock} rest day(s) after a block.`,
+    (cfg.minConsecutiveDay === cfg.minConsecutiveNight && cfg.maxConsecutiveDay === cfg.maxConsecutiveNight)
+      ? `Watch blocks run ${cfg.minConsecutiveDay ?? cfg.minConsecutive}–${cfg.maxConsecutiveDay ?? cfg.maxConsecutive} consecutive days, with at least ${cfg.restDaysAfterBlock} rest day(s) after a block.`
+      : `Day-watch blocks run ${cfg.minConsecutiveDay}–${cfg.maxConsecutiveDay} consecutive days and night-watch blocks run ${cfg.minConsecutiveNight}–${cfg.maxConsecutiveNight} consecutive days, with at least ${cfg.restDaysAfterBlock} rest day(s) after any block.`,
     `Switching day ↔ night requires at least ${cfg.switchDaynightOffDays} day(s) off in between.`,
+    ((cfg.minBlocksPerType ?? 1) > 1 || (cfg.maxBlocksPerType ?? 99) < 99)
+      ? `Each officer stays on the same shift type for ${cfg.minBlocksPerType}–${cfg.maxBlocksPerType} blocks before switching between day and night watches.`
+      : null,
     `Switching between a 12h watch and the 8h day-work shift requires at least ${cfg.switchWorkhoursOffDays} day(s) off in between.`,
-    `Hours, day/night counts, and weekend duties are shared as evenly as possible across the team.`,
-    `Approved PTO and sick days are kept clear of watches; sick days can also be patched after the roster is built, and the next period can continue on from this one.`,
-  ];
+    `Hours, day/night counts, and weekend duties are shared as evenly as possible across the team, and the same officer avoids working two weekends in a row wherever possible.`,
+    `Approved PTO and sick days are kept clear of watches before the roster is built.`,
+    `If a day- or night-watch officer goes sick after the roster is built: if a day-work officer is on duty that weekday they take the open watch; otherwise the roster is re-generated from the affected week on, keeping the rules and re-balancing weekends across the team. A sick day-work officer needs no cover.`,
+  ].filter(Boolean);
 }
 
 /* ============================================================================
@@ -432,7 +613,10 @@ export default function DutyOfficerScheduler() {
   const [nightLabel, setNightLabel] = useState("NIGHT"); const [nightTime, setNightTime] = useState("2200-1000"); const [nightHours, setNightHours] = useState(12);
   const [dwLabel, setDwLabel] = useState("DAY WORK"); const [dwTime, setDwTime] = useState("0800-1700"); const [dwHours, setDwHours] = useState(8);
 
-  const [minc, setMinc] = useState(2); const [maxc, setMaxc] = useState(3); const [rest, setRest] = useState(1);
+  const [mincDay, setMincDay] = useState(2); const [maxcDay, setMaxcDay] = useState(3);
+  const [mincNight, setMincNight] = useState(2); const [maxcNight, setMaxcNight] = useState(3);
+  const [rest, setRest] = useState(1);
+  const [minBlk, setMinBlk] = useState(2); const [maxBlk, setMaxBlk] = useState(3);
   const [swdn, setSwdn] = useState(2); const [swwh, setSwwh] = useState(1); const [enforceMin, setEnforceMin] = useState(true);
 
   const [wHours, setWHours] = useState(100), [wDnSelf, setWDnSelf] = useState(40),
@@ -466,7 +650,11 @@ export default function DutyOfficerScheduler() {
       dayLabel, dayTime, dayHours, nightLabel, nightTime, nightHours,
       dayworkLabel: dwLabel, dayworkTime: dwTime, dayworkHours: dwHours,
       dayworkPerWeek,
-      minConsecutive: enforceMin ? minc : 1, maxConsecutive: maxc, restDaysAfterBlock: rest,
+      minConsecutiveDay: enforceMin ? mincDay : 1, maxConsecutiveDay: maxcDay,
+      minConsecutiveNight: enforceMin ? mincNight : 1, maxConsecutiveNight: maxcNight,
+      minConsecutive: enforceMin ? Math.min(mincDay, mincNight) : 1, maxConsecutive: Math.max(maxcDay, maxcNight),
+      minBlocksPerType: Math.min(minBlk, maxBlk), maxBlocksPerType: Math.max(minBlk, maxBlk),
+      restDaysAfterBlock: rest,
       switchDaynightOffDays: swdn, switchWorkhoursOffDays: swwh,
       wHours, wDaynightSelf: wDnSelf, wDaynightSpread: wDnSpread, wWeekend: wWknd,
       unavailable: unavailable.some(a => a.length) ? unavailable : null,
@@ -476,7 +664,7 @@ export default function DutyOfficerScheduler() {
     }
     return cfg;
   }, [officers, weeks, startDate, dayLabel, dayTime, dayHours, nightLabel, nightTime, nightHours,
-    dwLabel, dwTime, dwHours, dayworkPerWeek, minc, maxc, rest, swdn, swwh, enforceMin,
+    dwLabel, dwTime, dwHours, dayworkPerWeek, mincDay, maxcDay, mincNight, maxcNight, rest, minBlk, maxBlk, swdn, swwh, enforceMin,
     wHours, wDnSelf, wDnSpread, wWknd, timeOff, carry]);
 
   const cfg = useMemo(() => buildCfg(), [buildCfg]);
@@ -531,15 +719,19 @@ export default function DutyOfficerScheduler() {
     setEditing(null);
     setRepairNote("");
     if (value === "PTO" || value === "SICK") {
+      const wasWatch = grid[o][t] === "DAY" || grid[o][t] === "NIGHT";
       const res = repair(result.cfg, grid, [{ o, t }]);
       setEditGrid(res.grid);
       setManualMarks(prev => ({ ...prev, [`${o}_${t}`]: value }));
-      const fills = res.changes.filter(c => c.fill).length;
-      setRepairNote(
-        `${result.cfg.officers[o]} marked ${value} on ${fmtDM(addDays(monday, t))}. ` +
-        (fills ? `Re-covered ${fills} watch slot(s) automatically. ` : "") +
-        (res.unresolved.length ? `${res.unresolved.length} slot(s) could not be auto-filled — see items to review.` : "")
-      );
+      const head = `${result.cfg.officers[o]} marked ${value} on ${fmtDM(addDays(monday, t))}. `;
+      const tail = res.unresolved.length ? ` ${res.unresolved.length} slot(s) still uncovered — see items to review.` : "";
+      let body;
+      if (!wasWatch) body = "No watch to re-cover.";
+      else if (res.method === "daywork") body = (res.notes[0] || "Covered by a day-work officer.") + " (Pulling a day-work officer onto a watch bends the 8h↔12h rest gap for that day — review below.)";
+      else if (res.method === "regenerated") body = res.notes[0] || "Roster re-generated from that day on.";
+      else if (res.method === "patched") body = res.notes.join(" ");
+      else body = "";
+      setRepairNote(head + body + tail);
     } else {
       const code = { OFF: "OFF", DAY: "DAY", NIGHT: "NIGHT", DAYWORK: "DAYWORK" }[value];
       setEditGrid(prev => prev.map((r, oo) => oo === o ? r.map((c, tt) => tt === t ? code : c) : r));
@@ -648,7 +840,7 @@ export default function DutyOfficerScheduler() {
   const serialize = () => ({
     officers, weeks, startDate, dayworkPerWeek, timeOff,
     dayLabel, dayTime, dayHours, nightLabel, nightTime, nightHours, dwLabel, dwTime, dwHours,
-    minc, maxc, rest, swdn, swwh, enforceMin, wHours, wDnSelf, wDnSpread, wWknd,
+    mincDay, maxcDay, mincNight, maxcNight, rest, minBlk, maxBlk, swdn, swwh, enforceMin, wHours, wDnSelf, wDnSpread, wWknd,
   });
   const loadSession = (file) => {
     const reader = new FileReader();
@@ -664,7 +856,12 @@ export default function DutyOfficerScheduler() {
         s.dayLabel != null && setDayLabel(s.dayLabel); s.dayTime != null && setDayTime(s.dayTime); s.dayHours != null && setDayHours(s.dayHours);
         s.nightLabel != null && setNightLabel(s.nightLabel); s.nightTime != null && setNightTime(s.nightTime); s.nightHours != null && setNightHours(s.nightHours);
         s.dwLabel != null && setDwLabel(s.dwLabel); s.dwTime != null && setDwTime(s.dwTime); s.dwHours != null && setDwHours(s.dwHours);
-        s.minc != null && setMinc(s.minc); s.maxc != null && setMaxc(s.maxc); s.rest != null && setRest(s.rest);
+        if (s.mincDay != null) setMincDay(s.mincDay); else if (s.minc != null) setMincDay(s.minc);
+        if (s.maxcDay != null) setMaxcDay(s.maxcDay); else if (s.maxc != null) setMaxcDay(s.maxc);
+        if (s.mincNight != null) setMincNight(s.mincNight); else if (s.minc != null) setMincNight(s.minc);
+        if (s.maxcNight != null) setMaxcNight(s.maxcNight); else if (s.maxc != null) setMaxcNight(s.maxc);
+        s.rest != null && setRest(s.rest);
+        s.minBlk != null && setMinBlk(s.minBlk); s.maxBlk != null && setMaxBlk(s.maxBlk);
         s.swdn != null && setSwdn(s.swdn); s.swwh != null && setSwwh(s.swwh); s.enforceMin != null && setEnforceMin(s.enforceMin);
         s.wHours != null && setWHours(s.wHours); s.wDnSelf != null && setWDnSelf(s.wDnSelf); s.wDnSpread != null && setWDnSpread(s.wDnSpread);
         s.wWknd != null && setWWknd(s.wWknd);
@@ -692,7 +889,13 @@ export default function DutyOfficerScheduler() {
       nightLabel: s.nightLabel ?? nightLabel, nightTime: s.nightTime ?? nightTime, nightHours: s.nightHours ?? nightHours,
       dayworkLabel: s.dwLabel ?? dwLabel, dayworkTime: s.dwTime ?? dwTime, dayworkHours: s.dwHours ?? dwHours,
       dayworkPerWeek: s.dayworkPerWeek ?? dayworkPerWeek,
-      minConsecutive: (s.enforceMin ?? enforceMin) ? (s.minc ?? minc) : 1, maxConsecutive: s.maxc ?? maxc,
+      minConsecutiveDay: (s.enforceMin ?? enforceMin) ? (s.mincDay ?? s.minc ?? mincDay) : 1,
+      maxConsecutiveDay: s.maxcDay ?? s.maxc ?? maxcDay,
+      minConsecutiveNight: (s.enforceMin ?? enforceMin) ? (s.mincNight ?? s.minc ?? mincNight) : 1,
+      maxConsecutiveNight: s.maxcNight ?? s.maxc ?? maxcNight,
+      minConsecutive: (s.enforceMin ?? enforceMin) ? Math.min(s.mincDay ?? s.minc ?? mincDay, s.mincNight ?? s.minc ?? mincNight) : 1,
+      maxConsecutive: Math.max(s.maxcDay ?? s.maxc ?? maxcDay, s.maxcNight ?? s.maxc ?? maxcNight),
+      minBlocksPerType: Math.min(s.minBlk ?? minBlk, s.maxBlk ?? maxBlk), maxBlocksPerType: Math.max(s.minBlk ?? minBlk, s.maxBlk ?? maxBlk),
       restDaysAfterBlock: s.rest ?? rest, switchDaynightOffDays: s.swdn ?? swdn, switchWorkhoursOffDays: s.swwh ?? swwh,
       wHours: s.wHours ?? wHours, wDaynightSelf: s.wDnSelf ?? wDnSelf, wDaynightSpread: s.wDnSpread ?? wDnSpread,
       wWeekend: s.wWknd ?? wWknd,
@@ -862,15 +1065,27 @@ export default function DutyOfficerScheduler() {
             ))}
           </Section>
 
-          <Section icon={ListChecks} title="Block & rest rules" help="How watch days are grouped into blocks and the rest required around them.">
-            <NumField label="Min consecutive watch days" value={minc} min={1} max={5} onChange={setMinc}
-              help="Shortest run of watch days in a row before a break — avoids isolated single days." />
-            <NumField label="Max consecutive watch days" value={maxc} min={2} max={7} onChange={setMaxc}
-              help="Longest run of watch days in a row before a mandatory break." />
+          <Section icon={ListChecks} title="Block & rest rules" help="How watch days are grouped into blocks and the rest required around them. Day-watch and night-watch blocks can have their own lengths.">
+            <p className="text-[11px] font-semibold text-slate-500 mt-0.5 mb-0.5">Day-watch blocks</p>
+            <NumField label="Min consecutive day-watch days" value={mincDay} min={1} max={5} onChange={setMincDay}
+              help="Shortest run of day watches in a row before a break — avoids isolated single day watches." />
+            <NumField label="Max consecutive day-watch days" value={maxcDay} min={2} max={7} onChange={setMaxcDay}
+              help="Longest run of day watches in a row before a mandatory break." />
+            <p className="text-[11px] font-semibold text-slate-500 mt-1.5 mb-0.5">Night-watch blocks</p>
+            <NumField label="Min consecutive night-watch days" value={mincNight} min={1} max={5} onChange={setMincNight}
+              help="Shortest run of night watches in a row before a break — avoids isolated single night watches." />
+            <NumField label="Max consecutive night-watch days" value={maxcNight} min={2} max={7} onChange={setMaxcNight}
+              help="Longest run of night watches in a row before a mandatory break. Set this lower than the day maximum if you want shorter night stretches." />
+            <p className="text-[11px] font-semibold text-slate-500 mt-1.5 mb-0.5">Blocks before switching day↔night</p>
+            <NumField label="Min same-type blocks before switch" value={minBlk} min={1} max={5} onChange={setMinBlk}
+              help="Fewest blocks (work stints) of the same shift type an officer does in a row before they're allowed to switch between day and night. Set to 1 to allow switching after every block." />
+            <NumField label="Max same-type blocks before switch" value={maxBlk} min={1} max={6} onChange={setMaxBlk}
+              help="Most blocks of the same shift type in a row before a switch is required. With min 2 / max 3, an officer does 2–3 day stints, then 2–3 night stints, and so on." />
+            <p className="text-[11px] font-semibold text-slate-500 mt-1.5 mb-0.5">Rest & switching</p>
             <NumField label="Rest days after a block" value={rest} min={1} max={4} onChange={setRest}
               help="Minimum days off immediately after finishing a block of the same shift type." />
             <NumField label="Off days when day↔night" value={swdn} min={0} max={5} onChange={setSwdn}
-              help="Minimum days off when switching between day and night watches. Applies at tour boundaries." />
+              help="Minimum days off when switching between day and night watches." />
             <NumField label="Off days when 12h↔8h" value={swwh} min={0} max={5} onChange={setSwwh}
               help="Minimum days off when switching between a 12h watch and the 8h day-work shift." />
             <label className="flex items-center gap-2 text-[13px] text-slate-700 py-1 mt-1 cursor-pointer">
