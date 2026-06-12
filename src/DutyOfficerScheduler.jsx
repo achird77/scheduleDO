@@ -57,6 +57,7 @@ function assignDayWork(cfg, rng, off, history) {
   const unavail = cfg.unavailable || null;
   const dwBlocked = (o, w) => { if (!unavail || !unavail[o]) return false; const ws = w * 7; for (const t of unavail[o]) if (t >= ws && t <= ws + 4) return true; return false; }; // can't do day-work in a week they're off
   for (let w = firstNew; w < W; w++) {
+    const want = Math.min(D, (cfg.weekDwCap && cfg.weekDwCap[w] != null) ? cfg.weekDwCap[w] : D);
     const order = shuffle([...Array(N).keys()], rng);
     order.sort((a, b) => count[a] - count[b]);
     const chosen = [];
@@ -67,9 +68,9 @@ function assignDayWork(cfg, rng, off, history) {
       for (let k = 1; k <= gwh; k++) { const c = history[o][7 - k]; if (c === DAY || c === NIGHT) return false; }
       return true;
     };
-    for (const o of order) { if (chosen.length >= D) break; if (!prev.includes(o) && free(o)) chosen.push(o); }
-    for (const o of order) { if (chosen.length >= D) break; if (!chosen.includes(o) && free(o)) chosen.push(o); }
-    for (const o of order) { if (chosen.length >= D) break; if (!chosen.includes(o) && !dwBlocked(o, w)) chosen.push(o); }
+    for (const o of order) { if (chosen.length >= want) break; if (!prev.includes(o) && free(o)) chosen.push(o); }
+    for (const o of order) { if (chosen.length >= want) break; if (!chosen.includes(o) && free(o)) chosen.push(o); }
+    for (const o of order) { if (chosen.length >= want) break; if (!chosen.includes(o) && !dwBlocked(o, w)) chosen.push(o); }
     for (const o of chosen) { dwWeek[o][w] = true; count[o]++; }
     prev = chosen;
   }
@@ -477,24 +478,43 @@ function repair(cfg, gridStr, unavail) {
     } else {
       // 3b. The light re-tiler couldn't balance it (denser/longer rosters) — rebuild the whole roster
       //     with every time-off day blocked, using the robust generator, optimised for balance.
+      //     If a week is so short-staffed that 2 watch slots + the full day-work quota can't all be
+      //     met under the rest rules, reduce day-work (the least-critical rule) rather than break a
+      //     rest/block rule — first only in the short-staffed weeks, then more broadly if needed.
       const unav = Array.from({ length: N }, () => []); for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) if (blockedAt[o][t]) unav[o].push(t);
-      const cfg2 = Object.assign({}, cfg, { unavailable: unav });
       const codeOf = (s) => s === "DAY" ? DAY : s === "NIGHT" ? NIGHT : s === "DAYWORK" ? DW : OFF;
-      let full = null, fullKey = null; const t1 = Date.now();
-      for (let s = 1; s <= 6 && Date.now() - t1 < 6500; s++) {
-        const r = generateSchedule(cfg2, (s * 1337 + earliest * 101 + 5) >>> 0, { timeLimitMs: 1400, maxAttempts: 100000 });
-        if (!r.ok) continue;
-        const a = r.grid.map(row => row.map(codeOf));
-        const wd = [...Array(N)].map((_, o) => wkDaysOf(a, o));
-        const key = [Math.max(...wd) - Math.min(...wd), consecOf(a), softScore(cfg, a)];
-        if (!fullKey || key[0] < fullKey[0] || (key[0] === fullKey[0] && (key[1] < fullKey[1] || (key[1] === fullKey[1] && key[2] < fullKey[2])))) { full = a; fullKey = key; }
-        if (fullKey[0] <= 2) break; // ideal weekend balance reached — stop early
+      const D0 = cfg.dayworkPerWeek || 0;
+      const heavyWeekday = (o, w) => { let c = 0; for (let d = 0; d < 5; d++) if (blockedAt[o][w * 7 + d]) c++; return c >= 3; };
+      const capLevels = [null];
+      if (D0 > 0) {
+        const cap = new Array(cfg.weeks).fill(D0); let any = false;
+        for (let w = 0; w < cfg.weeks; w++) { let h = 0; for (let o = 0; o < N; o++) if (heavyWeekday(o, w)) h++; if (h > 0) { cap[w] = Math.max(0, D0 - h); any = true; } }
+        if (any) capLevels.push(cap);
+        for (let d = D0 - 1; d >= 0; d--) capLevels.push(new Array(cfg.weeks).fill(d));
+      }
+      let full = null, fullKey = null, usedCap = null; const t1 = Date.now();
+      for (const cap of capLevels) {
+        if (Date.now() - t1 > 7000) break;
+        const cfg2 = Object.assign({}, cfg, { unavailable: unav, weekDwCap: cap });
+        let got = null, gotKey = null;
+        for (let s = 1; s <= 5 && Date.now() - t1 < 7000; s++) {
+          const r = generateSchedule(cfg2, (s * 1337 + earliest * 101 + 5) >>> 0, { timeLimitMs: 1300, maxAttempts: 100000 });
+          if (!r.ok) continue;
+          const a = r.grid.map(row => row.map(codeOf));
+          const wd = [...Array(N)].map((_, o) => wkDaysOf(a, o));
+          const key = [Math.max(...wd) - Math.min(...wd), consecOf(a), softScore(cfg, a)];
+          if (!gotKey || key[0] < gotKey[0] || (key[0] === gotKey[0] && (key[1] < gotKey[1] || (key[1] === gotKey[1] && key[2] < gotKey[2])))) { got = a; gotKey = key; }
+          if (gotKey[0] <= 2) break;
+        }
+        if (got) { full = got; fullKey = gotKey; usedCap = cap; break; } // first feasible level = least day-work reduction
       }
       if (full) {
         let ch = 0; for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) if (full[o][t] !== orig[o][t]) ch++;
         for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) g[o][t] = full[o][t];
         method = "regenerated";
-        notes.push(`Re-generated the roster with all rules kept and weekends re-balanced across the team (${ch} cell(s) changed).`);
+        let dwNote = "";
+        if (usedCap) { const parts = []; for (let w = 0; w < cfg.weeks; w++) if (usedCap[w] < D0) parts.push(`week ${w + 1} → ${usedCap[w]}`); if (parts.length) dwNote = ` Day-work was reduced (${parts.join(", ")}) because those weeks were too short-staffed to keep ${D0} day-workers and all watch rest rules — watch coverage and every rest/block rule were kept.`; }
+        notes.push(`Re-generated the roster with all watch rules kept and weekends re-balanced across the team (${ch} cell(s) changed).${dwNote}`);
       } else if (bestPartial) {
         // full rebuild couldn't be found in time — use the best limited-change re-tile we have
         const { cand, fd } = bestPartial;
@@ -521,7 +541,13 @@ function repair(cfg, gridStr, unavail) {
 
   let changed = 0;
   for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) if (g[o][t] !== orig[o][t]) changed++;
-  return { grid: g.map(r => r.map(c => CODE_NAME[c])), changes, notes, unresolved, method, changed };
+  const gridStrOut = g.map(r => r.map(c => CODE_NAME[c]));
+  const remaining = validate(cfg, gridStrOut);
+  if (remaining.length) {
+    method = "needs-review";
+    notes.push(`These absences are over-constrained — no schedule keeps every rule (often a full week off while still requiring all day-work slots). ${remaining.length} rule issue(s) remain; consider reducing day-work that week or arranging extra cover. Details: ${remaining.slice(0, 6).join("; ")}${remaining.length > 6 ? "; …" : ""}`);
+  }
+  return { grid: gridStrOut, changes, notes, unresolved, method, changed, problems: remaining };
 }
 
 function metrics(cfg, grid) {
@@ -777,6 +803,7 @@ export default function DutyOfficerScheduler() {
       if (!wasWatch) body = "No watch to re-cover.";
       else if (res.method === "daywork") body = res.notes[0] || "Covered by a day-work officer on duty that day.";
       else if (res.method === "regenerated") body = res.notes[res.notes.length - 1] || "Roster re-generated with the rules kept and weekends re-balanced.";
+      else if (res.method === "needs-review") body = res.notes[res.notes.length - 1] || "These absences can't all be covered within the rules — please review.";
       else if (res.method === "patched") body = res.notes.join(" ");
       else body = "";
       setRepairNote(head + body + tail);
