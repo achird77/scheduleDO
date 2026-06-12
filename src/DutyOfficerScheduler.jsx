@@ -54,11 +54,14 @@ function assignDayWork(cfg, rng, off, history) {
     for (let o = 0; o < N; o++) if (history[o].some(c => c === DW)) { dwWeek[o][0] = true; count[o]++; prev.push(o); }
   }
   if (D <= 0) return dwWeek;
+  const unavail = cfg.unavailable || null;
+  const dwBlocked = (o, w) => { if (!unavail || !unavail[o]) return false; const ws = w * 7; for (const t of unavail[o]) if (t >= ws && t <= ws + 4) return true; return false; }; // can't do day-work in a week they're off
   for (let w = firstNew; w < W; w++) {
     const order = shuffle([...Array(N).keys()], rng);
     order.sort((a, b) => count[a] - count[b]);
     const chosen = [];
     const free = (o) => {
+      if (dwBlocked(o, w)) return false;
       if (w !== firstNew || !history) return true; // only filter at the boundary week
       const gwh = Math.max(1, cfg.switchWorkhoursOffDays);
       for (let k = 1; k <= gwh; k++) { const c = history[o][7 - k]; if (c === DAY || c === NIGHT) return false; }
@@ -66,7 +69,7 @@ function assignDayWork(cfg, rng, off, history) {
     };
     for (const o of order) { if (chosen.length >= D) break; if (!prev.includes(o) && free(o)) chosen.push(o); }
     for (const o of order) { if (chosen.length >= D) break; if (!chosen.includes(o) && free(o)) chosen.push(o); }
-    for (const o of order) { if (chosen.length >= D) break; if (!chosen.includes(o)) chosen.push(o); }
+    for (const o of order) { if (chosen.length >= D) break; if (!chosen.includes(o) && !dwBlocked(o, w)) chosen.push(o); }
     for (const o of chosen) { dwWeek[o][w] = true; count[o]++; }
     prev = chosen;
   }
@@ -164,8 +167,13 @@ function slotChoices(cfg, a, t, S, rng) {
     }
     if (carry) { dayC += carry.day[o] || 0; nightC += carry.night[o] || 0; wknC += carry.weekend[o] || 0; days += (carry.day[o] || 0) + (carry.night[o] || 0); }
     const bal = S === DAY ? dayC - nightC : nightC - dayC;
-    cost[o] = days * 1.0 + (isWknd ? wknC * 3.0 : 0) + bal * 1.5 + rng() * 1.5;
-    if (wd === 5 && (a[o][t - 7] === DAY || a[o][t - 7] === NIGHT || (t - 6 >= 0 && (a[o][t - 6] === DAY || a[o][t - 6] === NIGHT)))) cost[o] += 8; // avoid back-to-back weekends
+    if (isWknd) {
+      // weekend slots: balancing weekend duty across the team is the priority
+      cost[o] = wknC * 20 + days * 0.2 + bal * 1.0 + rng() * 1.0;
+      if (wd === 5 && (a[o][t - 7] === DAY || a[o][t - 7] === NIGHT || (t - 6 >= 0 && (a[o][t - 6] === DAY || a[o][t - 6] === NIGHT)))) cost[o] += 25; // strongly avoid back-to-back weekends
+    } else {
+      cost[o] = days * 1.0 + bal * 1.5 + rng() * 1.5;
+    }
     if (prefer && t >= pFrom && prefer[o][t] === S) cost[o] -= 2; // gentle nudge toward the existing roster
   }
   opts.sort((x, y) => cost[x] - cost[y]);
@@ -236,15 +244,16 @@ function generateSchedule(cfg0, seed, opts = {}) {
   const { ecfg, off } = expand(cfg0);
   const history = cfg0.history || null;
   const rng = mulberry32(seed >>> 0), start = Date.now();
-  let best = null, bestScore = Infinity, attempts = 0;
+  const wkSpreadOf = (a) => { const N = ecfg.officers.length, carry = ecfg.carry; const w = [...Array(N)].map((_, o) => weekendOf(ecfg, a, o) + (carry ? carry.weekend[o] || 0 : 0)); return Math.max(...w) - Math.min(...w); };
+  let best = null, bestScore = Infinity, bestWsp = Infinity, attempts = 0;
   while (attempts < maxAttempts && Date.now() - start < timeLimit) {
     attempts++;
     const dwWeek = assignDayWork(ecfg, rng, off, history);
     const a = tileWatches(ecfg, dwWeek, rng, budget, off, history);
     if (!a) continue;
-    const sc = softScore(ecfg, a);
-    if (sc < bestScore) { bestScore = sc; best = a.map(r => r.slice()); }
-    if (sc === 0) break;
+    const sc = softScore(ecfg, a), wsp = wkSpreadOf(a);
+    if (wsp < bestWsp || (wsp === bestWsp && sc < bestScore)) { bestWsp = wsp; bestScore = sc; best = a.map(r => r.slice()); }
+    if (sc === 0 && wsp <= 2) break;
   }
   if (!best)
     return { ok: false, status: "INFEASIBLE", message: "No valid roster exists for these settings. Try adding an officer, reducing day-work per week, easing the time-off requests, allowing fewer blocks before a day↔night switch, or relaxing the consecutive/rest rules.", attempts };
@@ -396,6 +405,7 @@ function repair(cfg, gridStr, unavail) {
   const freed = [];
   for (const { o, t } of unavail) {
     if (o < 0 || o >= N || t < 0 || t >= T) continue;
+    blockedAt[o][t] = true; // never let a re-tile place a watch on a time-off day
     const c = g[o][t];
     if (c === DAY || c === NIGHT) {
       for (const x of wkPair(t).filter(x => x >= 0 && x < T)) {
@@ -407,7 +417,11 @@ function repair(cfg, gridStr, unavail) {
   }
   if (!freed.length) return { grid: g.map(r => r.map(c => CODE_NAME[c])), changes, notes, unresolved, method, changed: changes.length };
 
-  // 2. If every open slot is a weekday with a distinct day-work DO free, cover with day-work DOs.
+  const vcount = (gg) => validate(cfg, gg.map(r => r.map(c => CODE_NAME[c]))).length;
+
+  // 2. If every open slot is a weekday with a distinct free day-work DO, try covering with them —
+  //    but ONLY keep it if it breaks no rules (it usually does, because the day-work officer still
+  //    works 8h shifts on the surrounding days). Otherwise fall through to a clean re-generation.
   const allWeekday = freed.every(f => weekdayOf(cfg.startDow, f.t) < 5);
   let dwPlan = null;
   if (allWeekday) {
@@ -421,13 +435,15 @@ function repair(cfg, gridStr, unavail) {
   }
 
   if (dwPlan) {
-    for (const { p, t, S } of dwPlan) {
-      g[p][t] = S;
-      changes.push({ o: p, t, from: "DAYWORK", to: CODE_NAME[S], dwCover: true });
-      notes.push(`${cfg.officers[p]} moved from day-work to ${labelOf(S)} for day ${t + 1}.`);
-    }
-    method = "daywork";
-  } else {
+    const before = vcount(g), applied = [];
+    for (const { p, t, S } of dwPlan) { g[p][t] = S; applied.push({ p, t }); }
+    if (vcount(g) <= before) {
+      for (const { p, t, S } of dwPlan) { changes.push({ o: p, t, from: "DAYWORK", to: CODE_NAME[S], dwCover: true }); notes.push(`${cfg.officers[p]} moved from day-work to ${labelOf(S)} for day ${t + 1}.`); }
+      method = "daywork";
+    } else { for (const { p, t } of applied) g[p][t] = DW; dwPlan = null; } // would break a rule — undo and re-generate instead
+  }
+
+  if (!dwPlan) {
     // 3. No day-work cover — re-generate so the rules still hold and weekends stay balanced.
     //    Re-tile from the Monday of the affected week (backing up a week at a time only if needed),
     //    choosing the result with the most equal weekend split, fewest back-to-back weekends,
@@ -437,7 +453,7 @@ function repair(cfg, gridStr, unavail) {
     const levels = []; for (let fd = weekStart; fd >= 0; fd -= 7) levels.push(fd); if (levels[levels.length - 1] !== 0) levels.push(0);
     const wkDaysOf = (a, o) => { let n = 0; for (let w = 0; w < cfg.weeks; w++) for (const x of [w * 7 + 5, w * 7 + 6]) if (x < T && (a[o][x] === DAY || a[o][x] === NIGHT)) n++; return n; };
     const consecOf = (a) => { let c = 0; for (let o = 0; o < N; o++) { const ww = []; for (let w = 0; w < cfg.weeks; w++) { let on = false; for (const x of [w * 7 + 5, w * 7 + 6]) if (x < T && (a[o][x] === DAY || a[o][x] === NIGHT)) on = true; ww.push(on); } for (let w = 0; w < ww.length - 1; w++) if (ww[w] && ww[w + 1]) c++; } return c; };
-    let chosen = null, usedStart = earliest; const t0 = Date.now();
+    let chosen = null, usedStart = earliest, bestPartial = null; const t0 = Date.now();
     for (const fd of levels) {
       const cands = [];
       for (let s = 1; s <= 30 && Date.now() - t0 < 2200; s++) {
@@ -449,7 +465,8 @@ function repair(cfg, gridStr, unavail) {
       }
       if (cands.length) {
         cands.sort((a, b) => a.wkSp - b.wkSp || a.consec - b.consec || a.sc - b.sc || a.ch - b.ch);
-        chosen = cands[0]; usedStart = fd; break;
+        if (!bestPartial || cands[0].wkSp < bestPartial.cand.wkSp) bestPartial = { cand: cands[0], fd };
+        if (cands[0].wkSp <= 2) { chosen = cands[0]; usedStart = fd; break; } // limited-change re-tile that is also well balanced
       }
       if (Date.now() - t0 > 2200) break;
     }
@@ -458,18 +475,46 @@ function repair(cfg, gridStr, unavail) {
       method = "regenerated";
       notes.push(`Re-generated from day ${usedStart + 1} on — weekends and shifts re-balanced across the team (${chosen.ch} cell(s) changed). Earlier days are unchanged.`);
     } else {
-      // 4. Last resort — patch the open slot(s) locally (may bend a rest rule).
-      method = "patched";
-      const wkPairR = (t) => weekdayOf(cfg.startDow, t) === 5 ? [t, t + 1] : weekdayOf(cfg.startDow, t) === 6 ? [t - 1, t] : [t];
-      for (const { t, S } of freed) {
-        let cnt = 0; for (let o = 0; o < N; o++) if (g[o][t] === S) cnt++; if (cnt >= 1) continue;
-        const pair = wkPairR(t).filter(x => x >= 0 && x < T);
-        const cc = [...Array(N).keys()].filter(p => pair.every(x => g[p][x] === OFF && !blockedAt[p][x]));
-        let pchosen = -1;
-        for (const p of cc) { pair.forEach(x => { g[p][x] = S; }); if (!introducesProblem(cfg, g, p, T)) { pchosen = p; break; } pair.forEach(x => { g[p][x] = OFF; }); }
-        if (pchosen < 0 && cc.length) { pchosen = cc[0]; pair.forEach(x => { g[pchosen][x] = S; }); }
-        if (pchosen >= 0) { pair.forEach(x => changes.push({ o: pchosen, t: x, from: "OFF", to: CODE_NAME[S], fill: true })); notes.push(`${cfg.officers[pchosen]} covers the ${labelOf(S)} for day ${pair.map(x => x + 1).join("–")} (emergency cover — please review, it may bend a rest rule).`); }
-        else unresolved.push({ t, slot: CODE_NAME[S] });
+      // 3b. The light re-tiler couldn't balance it (denser/longer rosters) — rebuild the whole roster
+      //     with every time-off day blocked, using the robust generator, optimised for balance.
+      const unav = Array.from({ length: N }, () => []); for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) if (blockedAt[o][t]) unav[o].push(t);
+      const cfg2 = Object.assign({}, cfg, { unavailable: unav });
+      const codeOf = (s) => s === "DAY" ? DAY : s === "NIGHT" ? NIGHT : s === "DAYWORK" ? DW : OFF;
+      let full = null, fullKey = null; const t1 = Date.now();
+      for (let s = 1; s <= 6 && Date.now() - t1 < 6500; s++) {
+        const r = generateSchedule(cfg2, (s * 1337 + earliest * 101 + 5) >>> 0, { timeLimitMs: 1400, maxAttempts: 100000 });
+        if (!r.ok) continue;
+        const a = r.grid.map(row => row.map(codeOf));
+        const wd = [...Array(N)].map((_, o) => wkDaysOf(a, o));
+        const key = [Math.max(...wd) - Math.min(...wd), consecOf(a), softScore(cfg, a)];
+        if (!fullKey || key[0] < fullKey[0] || (key[0] === fullKey[0] && (key[1] < fullKey[1] || (key[1] === fullKey[1] && key[2] < fullKey[2])))) { full = a; fullKey = key; }
+        if (fullKey[0] <= 2) break; // ideal weekend balance reached — stop early
+      }
+      if (full) {
+        let ch = 0; for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) if (full[o][t] !== orig[o][t]) ch++;
+        for (let o = 0; o < N; o++) for (let t = 0; t < T; t++) g[o][t] = full[o][t];
+        method = "regenerated";
+        notes.push(`Re-generated the roster with all rules kept and weekends re-balanced across the team (${ch} cell(s) changed).`);
+      } else if (bestPartial) {
+        // full rebuild couldn't be found in time — use the best limited-change re-tile we have
+        const { cand, fd } = bestPartial;
+        for (let o = 0; o < N; o++) for (let t = fd; t < T; t++) g[o][t] = cand.res[o][t];
+        method = "regenerated";
+        notes.push(`Re-generated from day ${fd + 1} on — rules kept and weekends balanced as far as possible (${cand.ch} cell(s) changed).`);
+      } else {
+        // 4. Last resort — patch the open slot(s) locally (may bend a rest rule).
+        method = "patched";
+        const wkPairR = (t) => weekdayOf(cfg.startDow, t) === 5 ? [t, t + 1] : weekdayOf(cfg.startDow, t) === 6 ? [t - 1, t] : [t];
+        for (const { t, S } of freed) {
+          let cnt = 0; for (let o = 0; o < N; o++) if (g[o][t] === S) cnt++; if (cnt >= 1) continue;
+          const pair = wkPairR(t).filter(x => x >= 0 && x < T);
+          const cc = [...Array(N).keys()].filter(p => pair.every(x => g[p][x] === OFF && !blockedAt[p][x]));
+          let pchosen = -1;
+          for (const p of cc) { pair.forEach(x => { g[p][x] = S; }); if (!introducesProblem(cfg, g, p, T)) { pchosen = p; break; } pair.forEach(x => { g[p][x] = OFF; }); }
+          if (pchosen < 0 && cc.length) { pchosen = cc[0]; pair.forEach(x => { g[pchosen][x] = S; }); }
+          if (pchosen >= 0) { pair.forEach(x => changes.push({ o: pchosen, t: x, from: "OFF", to: CODE_NAME[S], fill: true })); notes.push(`${cfg.officers[pchosen]} covers the ${labelOf(S)} for day ${pair.map(x => x + 1).join("–")} (emergency cover — please review, it may bend a rest rule).`); }
+          else unresolved.push({ t, slot: CODE_NAME[S] });
+        }
       }
     }
   }
@@ -512,7 +557,7 @@ function rulesText(cfg) {
     `Switching between a 12h watch and the 8h day-work shift requires at least ${cfg.switchWorkhoursOffDays} day(s) off in between.`,
     `Hours, day/night counts, and weekend duties are shared as evenly as possible across the team, and the same officer avoids working two weekends in a row wherever possible.`,
     `Approved PTO and sick days are kept clear of watches before the roster is built.`,
-    `If a day- or night-watch officer goes sick after the roster is built: if a day-work officer is on duty that weekday they take the open watch; otherwise the roster is re-generated from the affected week on, keeping the rules and re-balancing weekends across the team. A sick day-work officer needs no cover.`,
+    `If a day- or night-watch officer goes sick after the roster is built: if a day-work officer is on duty that weekday and can take the watch without breaking a rest rule, they cover it; otherwise the roster is re-generated with all rules kept and weekends re-balanced across the team, changing as little as the rules allow. A sick day-work officer needs no cover.`,
   ].filter(Boolean);
 }
 
@@ -720,15 +765,18 @@ export default function DutyOfficerScheduler() {
     setRepairNote("");
     if (value === "PTO" || value === "SICK") {
       const wasWatch = grid[o][t] === "DAY" || grid[o][t] === "NIGHT";
-      const res = repair(result.cfg, grid, [{ o, t }]);
+      // re-cover against the full set of absences so the rebuild keeps every time-off day clear
+      const allMarks = { ...manualMarks, [`${o}_${t}`]: value };
+      const unavail = Object.keys(allMarks).map(k => { const [oo, tt] = k.split("_").map(Number); return { o: oo, t: tt }; });
+      const res = repair(result.cfg, grid, unavail);
       setEditGrid(res.grid);
-      setManualMarks(prev => ({ ...prev, [`${o}_${t}`]: value }));
+      setManualMarks(allMarks);
       const head = `${result.cfg.officers[o]} marked ${value} on ${fmtDM(addDays(monday, t))}. `;
       const tail = res.unresolved.length ? ` ${res.unresolved.length} slot(s) still uncovered — see items to review.` : "";
       let body;
       if (!wasWatch) body = "No watch to re-cover.";
-      else if (res.method === "daywork") body = (res.notes[0] || "Covered by a day-work officer.") + " (Pulling a day-work officer onto a watch bends the 8h↔12h rest gap for that day — review below.)";
-      else if (res.method === "regenerated") body = res.notes[0] || "Roster re-generated from that day on.";
+      else if (res.method === "daywork") body = res.notes[0] || "Covered by a day-work officer on duty that day.";
+      else if (res.method === "regenerated") body = res.notes[res.notes.length - 1] || "Roster re-generated with the rules kept and weekends re-balanced.";
       else if (res.method === "patched") body = res.notes.join(" ");
       else body = "";
       setRepairNote(head + body + tail);
