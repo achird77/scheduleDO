@@ -2,7 +2,7 @@ import React, { useState, useMemo, useRef, useCallback } from "react";
 import {
   Calendar, Users, Clock, Sliders, Wand2, RefreshCw,
   FileSpreadsheet, FileText, Save, FolderOpen, ListChecks, AlertTriangle,
-  HelpCircle, Repeat, CalendarOff,
+  HelpCircle, Repeat, CalendarOff, Undo2, Trash2,
 } from "lucide-react";
 
 // Duty Officer engine v2 — adds 3-4 week shift tours (a DO holds one shift type
@@ -700,6 +700,11 @@ export default function DutyOfficerScheduler() {
   const [tab, setTab] = useState("summary");
   const fileRef = useRef(null);
   const contRef = useRef(null);
+  const [undoStack, setUndoStack] = useState([]);
+  const [confirmReset, setConfirmReset] = useState(false);
+  // always-current mirror of the roster state, so history snapshots never go stale
+  const stateRef = useRef({});
+  stateRef.current = { result, editGrid, manualMarks, repairNote, carry, startDate, officers, weeks };
 
   const buildCfg = useCallback(() => {
     const m = mondayOf(startDate);
@@ -743,6 +748,7 @@ export default function DutyOfficerScheduler() {
   const T = weeks * 7;
 
   const run = useCallback(() => {
+    pushHistory();
     setBusy(true);
     setStatus("Generating…");
     setRepairNote("");
@@ -787,6 +793,7 @@ export default function DutyOfficerScheduler() {
 
   // edit a single cell; PTO/SICK on a watch triggers an auto-repair of that slot
   const applyEdit = (o, t, value) => {
+    pushHistory();
     setEditing(null);
     setRepairNote("");
     if (value === "PTO" || value === "SICK") {
@@ -812,6 +819,47 @@ export default function DutyOfficerScheduler() {
       setEditGrid(prev => prev.map((r, oo) => oo === o ? r.map((c, tt) => tt === t ? code : c) : r));
       setManualMarks(prev => { const n = { ...prev }; delete n[`${o}_${t}`]; return n; });
     }
+  };
+
+  /* ---- undo history ---- */
+  const snapshot = () => {
+    const s = stateRef.current;
+    return {
+      result: s.result, editGrid: s.editGrid ? s.editGrid.map(r => r.slice()) : null,
+      manualMarks: { ...s.manualMarks }, repairNote: s.repairNote, carry: s.carry, startDate: s.startDate,
+    };
+  };
+  const pushHistory = () => setUndoStack(prev => [...prev.slice(-29), snapshot()]);
+  const undo = () => {
+    setUndoStack(prev => {
+      if (!prev.length) return prev;
+      const snap = prev[prev.length - 1];
+      setResult(snap.result); setEditGrid(snap.editGrid); setManualMarks(snap.manualMarks);
+      setRepairNote(snap.repairNote); setCarry(snap.carry); setStartDate(snap.startDate);
+      setEditing(null); setStatus("Reverted the last change.");
+      return prev.slice(0, -1);
+    });
+  };
+
+  /* ---- reset to a blank slate ---- */
+  const doReset = () => {
+    pushHistory();
+    setResult(null); setEditGrid(null); setManualMarks({}); setRepairNote(""); setEditing(null);
+    setConfirmReset(false);
+    setStatus("Roster cleared. Set up your team and generate when ready.");
+  };
+
+  /* ---- continuity: carry on from the roster currently on screen ---- */
+  const continueFromCurrent = () => {
+    if (!grid) { setStatus("Generate or load a roster first to continue from it."); return; }
+    const gridOut = grid.map((row, o) => row.map((c, t) => markAt(o, t) || c));
+    const s = serialize();
+    const cy = buildCarryFrom(s, gridOut);
+    if (!cy) { setStatus("Nothing to continue from on the current roster."); return; }
+    pushHistory();
+    setCarry(cy);
+    if (cy.nextStartISO) setStartDate(cy.nextStartISO);
+    setStatus(`Continuity set from the current roster — the next roster starts ${cy.nextStartISO} and follows on from it. Press Re-generate.`);
   };
 
   // build continuity carry-over from a saved session's grid + settings
@@ -1010,8 +1058,8 @@ export default function DutyOfficerScheduler() {
         [class~="text-[13px]"]{font-size:13px}
         [class~="text-[12px]"]{font-size:12px}
         [class~="text-[11px]"]{font-size:11px}
-        [class~="max-w-[1400px]"]{max-width:1400px}
-        [class~="max-h-[52vh]"]{max-height:52vh}
+        [class~="max-w-[1860px]"]{max-width:1860px}
+        [class~="max-h-[72vh]"]{max-height:72vh}
         [class~="top-[26px]"]{top:26px}
         [class~="accent-[#1f3864]"]{accent-color:#1f3864}
         [class~="hover:bg-[#16294a]"]:hover{background-color:#16294a}
@@ -1024,7 +1072,7 @@ export default function DutyOfficerScheduler() {
       `}</style>
       {/* Header */}
       <header className="bg-[#1f3864] text-white">
-        <div className="max-w-[1400px] mx-auto px-5 py-4 flex items-center justify-between gap-4 flex-wrap">
+        <div className="max-w-[1860px] mx-auto px-5 py-4 flex items-center justify-between gap-4 flex-wrap">
           <div>
             <h1 className="text-[20px] font-bold tracking-tight">Duty Officer Schedule Planner</h1>
             <p className="text-[12px] text-white/70">Build a fair, rule-checked watch roster in seconds.</p>
@@ -1036,7 +1084,7 @@ export default function DutyOfficerScheduler() {
         </div>
       </header>
 
-      <div className="max-w-[1400px] mx-auto px-5 py-5 grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-5">
+      <div className="max-w-[1860px] mx-auto px-5 py-5 grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-5">
         {/* ---------------- Settings ---------------- */}
         <aside className="lg:max-h-[calc(100vh-110px)] lg:overflow-y-auto lg:pr-1">
           <Section icon={Users} title="Duty officers" help="The duty officers to roster. This tour model needs at least 2 day-watch and 2 night-watch officers each week, so a minimum of 4 (plus 1 more for every officer you put on day-work).">
@@ -1116,10 +1164,18 @@ export default function DutyOfficerScheduler() {
                 <button onClick={() => setCarry(null)} className="font-bold opacity-70 hover:opacity-100">×</button>
               </div>
             ) : (
-              <button onClick={() => contRef.current?.click()}
-                className="w-full inline-flex items-center justify-center gap-1.5 rounded-md border border-slate-300 bg-white py-1.5 text-[13px] font-medium hover:bg-slate-50">
-                <FolderOpen size={15} /> Continue from previous period…
-              </button>
+              <>
+                {result && (
+                  <button onClick={continueFromCurrent}
+                    className="w-full mb-2 inline-flex items-center justify-center gap-1.5 rounded-md border border-[#1f3864] bg-[#1f3864] text-white py-1.5 text-[13px] font-medium hover:bg-[#16294a]">
+                    <Repeat size={15} /> Continue from the current roster
+                  </button>
+                )}
+                <button onClick={() => contRef.current?.click()}
+                  className="w-full inline-flex items-center justify-center gap-1.5 rounded-md border border-slate-300 bg-white py-1.5 text-[13px] font-medium hover:bg-slate-50">
+                  <FolderOpen size={15} /> Continue from a saved file…
+                </button>
+              </>
             )}
             <input ref={contRef} type="file" accept="application/json,.json" className="hidden"
               onChange={e => { const f = e.target.files?.[0]; if (f) continueFrom(f); e.target.value = ""; }} />
@@ -1191,6 +1247,14 @@ export default function DutyOfficerScheduler() {
               className="col-span-2 inline-flex items-center justify-center gap-2 rounded-xl bg-[#1f3864] text-white font-semibold py-2.5 text-[14px] hover:bg-[#16294a] disabled:opacity-60 transition">
               <Wand2 size={16} /> {result ? "Re-generate" : "Generate roster"}
             </button>
+            <button onClick={undo} disabled={!undoStack.length}
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-300 bg-white py-2 text-[13px] font-medium hover:bg-slate-50 disabled:opacity-50">
+              <Undo2 size={15} /> Undo
+            </button>
+            <button onClick={() => setConfirmReset(true)} disabled={!result && !grid}
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-rose-300 bg-white text-rose-700 py-2 text-[13px] font-medium hover:bg-rose-50 disabled:opacity-50">
+              <Trash2 size={15} /> Reset
+            </button>
             <button onClick={exportXLSX} disabled={!grid}
               className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-300 bg-white py-2 text-[13px] font-medium hover:bg-slate-50 disabled:opacity-50">
               <FileSpreadsheet size={15} /> Excel
@@ -1228,7 +1292,7 @@ export default function DutyOfficerScheduler() {
             </div>
 
             {grid ? (
-              <div className="overflow-auto max-h-[52vh]">
+              <div className="overflow-auto max-h-[72vh]">
                 <table className="border-collapse text-[11px]">
                   <thead>
                     <tr>
@@ -1254,13 +1318,15 @@ export default function DutyOfficerScheduler() {
                           const code = dispCode(o, t);
                           const st = SHIFT_STYLE[code] || SHIFT_STYLE.OFF;
                           const isEditing = editing && editing.o === o && editing.t === t;
+                          const openUp = o >= result.cfg.officers.length - 2;   // bottom rows: open upward
+                          const openLeft = t >= T - 3;                           // right edge: align right
                           return (
                             <td key={t} className="relative border border-white/70 px-1.5 py-1.5 text-center whitespace-nowrap cursor-pointer hover:ring-2 hover:ring-[#1f3864]/40"
                               style={{ background: st.bg, color: st.fg }}
                               onClick={() => setEditing(isEditing ? null : { o, t })}>
                               {cellText(result.cfg, code)}
                               {isEditing && (
-                                <div className="absolute z-40 left-1/2 -translate-x-1/2 mt-1 top-full bg-white border border-slate-300 rounded-lg shadow-lg p-1 text-left"
+                                <div className={`absolute z-40 ${openUp ? "bottom-full mb-1" : "top-full mt-1"} ${openLeft ? "right-0" : "left-1/2 -translate-x-1/2"} bg-white border border-slate-300 rounded-lg shadow-lg p-1 text-left`}
                                   onClick={ev => ev.stopPropagation()}>
                                   {[["DAY", cfg.dayLabel], ["NIGHT", cfg.nightLabel], ["DAYWORK", cfg.dayworkLabel], ["OFF", "Off"], ["SICK", "Sick"], ["PTO", "PTO"]].map(([v, lab]) => (
                                     <button key={v} onClick={() => applyEdit(o, t, v)}
@@ -1359,6 +1425,19 @@ export default function DutyOfficerScheduler() {
           </div>
         </main>
       </div>
+
+      {confirmReset && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4" onClick={() => setConfirmReset(false)}>
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm p-5" onClick={e => e.stopPropagation()}>
+            <h3 className="text-[15px] font-bold text-[#1f3864] mb-1.5 flex items-center gap-2"><Trash2 size={17} /> Reset the roster?</h3>
+            <p className="text-[13px] text-slate-600 mb-4">This clears the current roster and all sick / PTO marks, returning to a blank slate. Your settings stay as they are, and you can still press <span className="font-semibold">Undo</span> afterwards.</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setConfirmReset(false)} className="px-3.5 py-1.5 rounded-lg border border-slate-300 text-[13px] font-medium hover:bg-slate-50">Cancel</button>
+              <button onClick={doReset} className="px-3.5 py-1.5 rounded-lg bg-rose-600 text-white text-[13px] font-semibold hover:bg-rose-700">Reset roster</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
