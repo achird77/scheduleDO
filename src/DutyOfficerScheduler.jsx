@@ -1292,7 +1292,7 @@ export default function DutyOfficerScheduler() {
             </div>
 
             {grid ? (
-              <div className="overflow-auto max-h-[72vh]">
+              <div className="overflow-auto max-h-[72vh]" onScroll={() => editing && setEditing(null)}>
                 <table className="border-collapse text-[11px]">
                   <thead>
                     <tr>
@@ -1318,24 +1318,11 @@ export default function DutyOfficerScheduler() {
                           const code = dispCode(o, t);
                           const st = SHIFT_STYLE[code] || SHIFT_STYLE.OFF;
                           const isEditing = editing && editing.o === o && editing.t === t;
-                          const openUp = o >= result.cfg.officers.length - 2;   // bottom rows: open upward
-                          const openLeft = t >= T - 3;                           // right edge: align right
                           return (
-                            <td key={t} className="relative border border-white/70 px-1.5 py-1.5 text-center whitespace-nowrap cursor-pointer hover:ring-2 hover:ring-[#1f3864]/40"
+                            <td key={t} className="border border-white/70 px-1.5 py-1.5 text-center whitespace-nowrap cursor-pointer hover:ring-2 hover:ring-[#1f3864]/40"
                               style={{ background: st.bg, color: st.fg }}
-                              onClick={() => setEditing(isEditing ? null : { o, t })}>
+                              onClick={(e) => setEditing(isEditing ? null : { o, t, rect: e.currentTarget.getBoundingClientRect() })}>
                               {cellText(result.cfg, code)}
-                              {isEditing && (
-                                <div className={`absolute z-40 ${openUp ? "bottom-full mb-1" : "top-full mt-1"} ${openLeft ? "right-0" : "left-1/2 -translate-x-1/2"} bg-white border border-slate-300 rounded-lg shadow-lg p-1 text-left`}
-                                  onClick={ev => ev.stopPropagation()}>
-                                  {[["DAY", cfg.dayLabel], ["NIGHT", cfg.nightLabel], ["DAYWORK", cfg.dayworkLabel], ["OFF", "Off"], ["SICK", "Sick"], ["PTO", "PTO"]].map(([v, lab]) => (
-                                    <button key={v} onClick={() => applyEdit(o, t, v)}
-                                      className="block w-full text-left px-3 py-1 text-[12px] rounded hover:bg-slate-100 whitespace-nowrap" style={{ color: "#334155" }}>
-                                      <span className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle" style={{ background: SHIFT_STYLE[v].bg }} />{lab}
-                                    </button>
-                                  ))}
-                                </div>
-                              )}
                             </td>
                           );
                         })}
@@ -1425,6 +1412,25 @@ export default function DutyOfficerScheduler() {
           </div>
         </main>
       </div>
+
+      {editing && editing.rect && (() => {
+        const r = editing.rect, MW = 170, MH = 232;
+        let left = r.left; if (left + MW > window.innerWidth - 8) left = window.innerWidth - MW - 8; if (left < 8) left = 8;
+        let top = r.bottom + 4; if (top + MH > window.innerHeight - 8) top = r.top - MH - 4; if (top < 8) top = 8;
+        return (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setEditing(null)} />
+            <div className="fixed z-50 bg-white border border-slate-300 rounded-lg shadow-xl p-1 text-left" style={{ left, top, width: MW }}>
+              {[["DAY", cfg.dayLabel], ["NIGHT", cfg.nightLabel], ["DAYWORK", cfg.dayworkLabel], ["OFF", "Off"], ["SICK", "Sick"], ["PTO", "PTO"]].map(([v, lab]) => (
+                <button key={v} onClick={() => applyEdit(editing.o, editing.t, v)}
+                  className="block w-full text-left px-3 py-1.5 text-[12px] rounded hover:bg-slate-100 whitespace-nowrap" style={{ color: "#334155" }}>
+                  <span className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle" style={{ background: SHIFT_STYLE[v].bg }} />{lab}
+                </button>
+              ))}
+            </div>
+          </>
+        );
+      })()}
 
       {confirmReset && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4" onClick={() => setConfirmReset(false)}>
